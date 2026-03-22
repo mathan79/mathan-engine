@@ -4,3 +4,5 @@ pyotp
 smartapi-python
 requests
 gunicorn
+logzero
+websocket-client
