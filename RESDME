@@ -1,0 +1,29 @@
+# MATHAN AI HEMAN
+## High Efficiency Market Adaptive Network
+
+> CCS is BODY | AI Brain is SOUL | Live Data is BLOOD
+
+### System Architecture
+- **L1-L13** — 13 Intelligence Agents
+- **L14 NAMBI** — Master Controller
+- **L15** — Market Truth Engine
+- **L16** — OI/PCR Contradiction Engine
+- **L17** — Self Learning Engine
+- **CCS** — Command Control System
+
+### Deploy on Render
+1. Push this repo to GitHub
+2. Create new Web Service on render.com
+3. Set Start Command: `python app.py`
+4. Set Environment Variable: `PORT=8000`
+5. Open dashboard → Setup tab → Enter Angel One credentials
+
+### Endpoints
+- `/` — Main Dashboard
+- `/ping` — Health check
+- `/status` — Full system state (JSON)
+- `/ccs` — CCS event log
+- `/ws` — WebSocket
+
+### Data Flow
+Angel One WS → OI Data → L1-L13 Agents → CCS → L16 Contradiction → L15 Truth → L14 NAMBI → Decision → Telegram
