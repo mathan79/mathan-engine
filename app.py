@@ -7,7 +7,7 @@ From Behaviour to Decision | From Decision to Execution | From Execution to Inte
 
 Layers: L1-L13 Agents + L14 NAMBI + L15 Truth + L16 Contradiction + L17 Learning
 """
-import os,json,time,threading,datetime,requests,pyotp,logging,sqlite3
+import os,json,time,threading,datetime,requests,pyotp,logging
 from flask import Flask,Response,jsonify,request
 from flask_cors import CORS
 
