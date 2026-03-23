@@ -1,7 +1,4 @@
-flask==3.0.3
-flask-cors==4.0.0
-requests==2.32.3
-pyotp==2.9.0
-smartapi-python
-websocket-client==1.8.0
-logzero
+flask
+flask-cors
+requests
+pyotp
