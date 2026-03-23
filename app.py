@@ -101,12 +101,23 @@ def db_get(k):
         c.close();return r[0] if r else None
     except:return None
 def db_load():
+    # First load from DB
     for f in ["api_key","client_id","pin","totp_secret"]:
         v=db_get(f"angel_{f}")
         if v:ANGEL[f]=v
+    # Override with Environment Variables if set
+    env_map={"api_key":"ANGEL_API_KEY","client_id":"ANGEL_CLIENT_ID",
+             "pin":"ANGEL_PIN","totp_secret":"ANGEL_TOTP_SECRET"}
+    for f,env in env_map.items():
+        v=os.environ.get(env,"").strip()
+        if v:
+            ANGEL[f]=v
+            db_set(f"angel_{f}",v)
+            log.info(f"[CONFIG] Loaded {env} from environment")
     idx=db_get("index")
     if idx in INDEX_CFG:SYS["index"]=idx
-    tt=db_get("tg_token");tc=db_get("tg_chat")
+    tt=os.environ.get("TELEGRAM_TOKEN","") or db_get("tg_token")
+    tc=os.environ.get("TELEGRAM_CHAT","") or db_get("tg_chat")
     if tt:TELEGRAM["token"]=tt
     if tc:TELEGRAM["chat_id"]=tc
     if tt and tc:TELEGRAM["enabled"]=True
@@ -841,9 +852,9 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 
 /* TABS */
 .tabs{display:flex;gap:0;margin-bottom:9px;background:var(--bg2);border:1px solid var(--brd);border-radius:9px;padding:3px;overflow-x:auto;}
-.tab{flex:1;padding:8px 4px;border-radius:7px;cursor:pointer;font-family:Orbitron;font-size:8px;letter-spacing:.5px;color:var(--dim);text-align:center;white-space:nowrap;border:none;background:transparent;min-width:60px;}
+.tab{flex:1;padding:8px 4px;border-radius:7px;cursor:pointer;font-family:Orbitron;font-size:8px;letter-spacing:.5px;color:var(--dim);text-align:center;white-space:nowrap;border:none;background:transparent;min-width:60px;text-decoration:none;display:flex;align-items:center;justify-content:center;}
 .tab.on{background:var(--gold);color:#000;font-weight:900;}
-.tc{display:none;}.tc.on{display:block;}
+.tc{display:none!important;}.tc.on{display:block!important;}
 </style>
 </head>
 <body>
@@ -874,10 +885,10 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 <div class="smsg" id="smsg"></div>
 
 <div class="tabs" id="tabs">
-  <button class="tab on" id="tab-market" onclick="showTab('market')">MARKET</button>
-  <button class="tab" id="tab-agents" onclick="showTab('agents')">AGENTS</button>
-  <button class="tab" id="tab-engines" onclick="showTab('engines')">ENGINES</button>
-  <button class="tab" id="tab-setup" onclick="showTab('setup')">SETUP</button>
+  <a class="tab on" id="tab-market" href="javascript:void(0)" onclick="showTab('market');return false;">MARKET</a>
+  <a class="tab" id="tab-agents" href="javascript:void(0)" onclick="showTab('agents');return false;">AGENTS</a>
+  <a class="tab" id="tab-engines" href="javascript:void(0)" onclick="showTab('engines');return false;">ENGINES</a>
+  <a class="tab" id="tab-setup" href="javascript:void(0)" onclick="showTab('setup');return false;">SETUP</a>
 </div>
 
 <!-- MARKET -->
@@ -1049,8 +1060,16 @@ function showTab(id){
     var t=tabs[i];
     var btn=document.getElementById('tab-'+t);
     var pane=document.getElementById('tc-'+t);
-    if(t===id){btn.className='tab on';pane.className='tc on';}
-    else{btn.className='tab';pane.className='tc';}
+    if(!btn||!pane)continue;
+    if(t===id){
+      btn.className='tab on';
+      pane.style.display='block';
+      pane.className='tc on';
+    }else{
+      btn.className='tab';
+      pane.style.display='none';
+      pane.className='tc';
+    }
   }
 }
 
@@ -1306,7 +1325,27 @@ setInterval(function(){
   tx('rtxt','IST '+p(n.getHours())+':'+p(n.getMinutes()));
 },1000);
 
-window.onload=function(){loadSaved();startPoll();};
+window.onload=function(){
+  loadSaved();
+  startPoll();
+  // Backup tab click handlers
+  var tabNames=['market','agents','engines','setup'];
+  for(var i=0;i<tabNames.length;i++){
+    (function(name){
+      var el=document.getElementById('tab-'+name);
+      if(el){
+        el.addEventListener('click',function(e){
+          e.preventDefault();
+          showTab(name);
+        });
+        el.addEventListener('touchend',function(e){
+          e.preventDefault();
+          showTab(name);
+        });
+      }
+    })(tabNames[i]);
+  }
+};
 </script>
 </body>
 </html>"""
