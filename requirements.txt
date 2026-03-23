@@ -1,10 +1,7 @@
 flask==3.0.3
 flask-cors==4.0.0
-flask-sock==0.7.0
-simple-websocket==1.1.0
 requests==2.32.3
 pyotp==2.9.0
 smartapi-python
 websocket-client==1.8.0
 logzero
-gunicorn==21.2.0
