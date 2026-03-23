@@ -16,8 +16,12 @@ Open:
 
 import os, json, time, threading, datetime, socket, requests, sqlite3
 import pyotp
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+try:
+    from SmartApi import SmartConnect
+    SMARTAPI_OK = True
+except ImportError:
+    SMARTAPI_OK = False
+    print("[WARN] SmartAPI not installed — Angel One disabled")
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 
