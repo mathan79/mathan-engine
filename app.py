@@ -580,16 +580,92 @@ def build_state():
     }
 
 app=Flask(__name__)
+# ── FLASK APP ─────────────────────────────────────────────────────
+app=Flask(__name__)
 sock=Sock(app)
 
+# ── REST: ANGEL CONNECT ───────────────────────────────────────────
+@app.route("/connect_angel",methods=["POST"])
+def connect_angel_rest():
+    d=request.get_json(force=True) or {}
+    ak=d.get("api_key","").strip();ci=d.get("client_id","").strip()
+    pin=d.get("pin","").strip();ts=d.get("totp_secret","").strip()
+    if not all([ak,ci,pin,ts]):return jsonify({"ok":False,"error":"All 4 required"}),400
+    threading.Thread(target=do_angel_connect,args=(ak,ci,pin,ts),daemon=True).start()
+    return jsonify({"ok":True,"msg":"Login started"})
+
+# ── REST: STATE (polling) ─────────────────────────────────────────
+@app.route("/api/state")
+def api_state():
+    return jsonify(build_state())
+
+@app.route("/api/fetch",methods=["POST"])
+def api_fetch():
+    threading.Thread(target=full_cycle,daemon=True).start()
+    return jsonify({"ok":True})
+
+@app.route("/api/set_index",methods=["POST"])
+def api_set_index():
+    d=request.get_json(force=True) or {}
+    idx=d.get("index","NIFTY").upper()
+    if idx in INDEX_CFG:
+        with state_lock:SYS["index"]=idx
+        db_set("index",idx)
+    return jsonify({"ok":True,"index":SYS["index"]})
+
+@app.route("/api/set_auto",methods=["POST"])
+def api_set_auto():
+    d=request.get_json(force=True) or {}
+    SYS["auto"]=bool(d.get("on",True))
+    return jsonify({"ok":True,"auto":SYS["auto"]})
+
+@app.route("/api/set_telegram",methods=["POST"])
+def api_set_telegram():
+    d=request.get_json(force=True) or {}
+    tt=d.get("token","").strip();tc=d.get("chat_id","").strip()
+    if tt and tc:
+        TELEGRAM["token"]=tt;TELEGRAM["chat_id"]=tc;TELEGRAM["enabled"]=True
+        db_set("tg_token",tt);db_set("tg_chat",tc)
+        tg_alert("✅ HEMAN Telegram connected!")
+        return jsonify({"ok":True})
+    return jsonify({"ok":False}),400
+
+@app.route("/api/set_capital",methods=["POST"])
+def api_set_capital():
+    d=request.get_json(force=True) or {}
+    try:
+        EXEC["capital"]=float(d.get("capital",10000))
+        db_set("capital",EXEC["capital"])
+    except:pass
+    return jsonify({"ok":True,"capital":EXEC["capital"]})
+
+@app.route("/api/ccs")
+def api_ccs():
+    with CCS_LOCK:return jsonify({"events":list(CCS_LOG[-50:])})
+
+# ── SSE: LIVE EVENTS ──────────────────────────────────────────────
+@app.route("/api/events")
+def api_events():
+    def stream():
+        last=0
+        while True:
+            try:
+                state=build_state()
+                data=json.dumps({"type":"state","state":state,"ts":ist()})
+                yield f"data: {data}\n\n"
+                time.sleep(3)
+            except GeneratorExit:break
+            except:time.sleep(5)
+    return Response(stream(),mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+# ── WEBSOCKET (kept for compatibility) ───────────────────────────
 @sock.route("/ws")
 def ws_handler(ws):
-    cl_add(ws)
+    _clients.append(ws)
     try:
         send1(ws,{"type":"connected","ts":ist()})
         send1(ws,{"type":"full_state","state":build_state()})
-        with CCS_LOCK:recent=list(CCS_LOG[-20:])
-        send1(ws,{"type":"ccs_history","events":recent})
         while True:
             raw=ws.receive(timeout=30)
             if raw is None:break
@@ -600,61 +676,36 @@ def ws_handler(ws):
             elif t=="connect_angel":
                 ak=d.get("api_key","").strip();ci=d.get("client_id","").strip()
                 pin=d.get("pin","").strip();ts2=d.get("totp_secret","").strip()
-                if not all([ak,ci,pin,ts2]):send1(ws,{"type":"angel_err","msg":"All 4 fields required"});continue
-                threading.Thread(target=do_angel_connect,args=(ak,ci,pin,ts2),daemon=True).start()
+                if all([ak,ci,pin,ts2]):
+                    threading.Thread(target=do_angel_connect,args=(ak,ci,pin,ts2),daemon=True).start()
             elif t=="set_index":
                 idx=d.get("index","NIFTY").upper()
                 if idx in INDEX_CFG:
                     with state_lock:SYS["index"]=idx
                     db_set("index",idx)
-                    threading.Thread(target=full_cycle,daemon=True).start()
             elif t=="fetch":threading.Thread(target=full_cycle,daemon=True).start()
             elif t=="set_auto":SYS["auto"]=bool(d.get("on",True))
-            elif t=="set_telegram":
-                tt=d.get("token","").strip();tc=d.get("chat_id","").strip()
-                if tt and tc:
-                    TELEGRAM["token"]=tt;TELEGRAM["chat_id"]=tc;TELEGRAM["enabled"]=True
-                    db_set("tg_token",tt);db_set("tg_chat",tc)
-                    tg_alert("✅ HEMAN Telegram connected!")
-                    send1(ws,{"type":"tg_ok","ts":ist()})
-            elif t=="set_capital":
-                try:EXEC["capital"]=float(d.get("capital",10000));db_set("capital",EXEC["capital"])
-                except:pass
             elif t=="get_state":send1(ws,{"type":"full_state","state":build_state()})
             elif t=="get_ccs_log":
-                with CCS_LOCK:recent=list(CCS_LOG[-50:])
-                send1(ws,{"type":"ccs_history","events":recent})
-    except Exception as e:log.error(f"[WS ERR]{e}")
-    finally:cl_rm(ws)
-
-@app.route("/connect_angel",methods=["POST"])
-def connect_angel_rest():
-    d=request.get_json(force=True) or {}
-    ak=d.get("api_key","").strip();ci=d.get("client_id","").strip()
-    pin=d.get("pin","").strip();ts=d.get("totp_secret","").strip()
-    if not all([ak,ci,pin,ts]):return jsonify({"ok":False,"error":"All 4 required"}),400
-    threading.Thread(target=do_angel_connect,args=(ak,ci,pin,ts),daemon=True).start()
-    return jsonify({"ok":True,"msg":"Login started"})
+                with CCS_LOCK:send1(ws,{"type":"ccs_history","events":list(CCS_LOG[-50:])})
+    except Exception as e:log.error(f"[WS]{e}")
+    finally:
+        try:_clients.remove(ws)
+        except:pass
 
 @app.route("/ping")
 def ping():
-    return jsonify({"pong":True,"time":ist(),"angel":ANGEL["connected"],
-                    "ws":ANGEL["ws_running"],"system":"MATHAN AI HEMAN"})
+    return jsonify({"pong":True,"time":ist(),"angel":ANGEL["connected"],"ws":ANGEL["ws_running"],"system":"MATHAN AI HEMAN"})
 
 @app.route("/status")
 def status():return jsonify(build_state())
 
-@app.route("/ccs")
-def ccs():
-    with CCS_LOCK:return jsonify({"events":list(CCS_LOG)})
-
 @app.route("/")
 @app.route("/dashboard")
-def dashboard():
-    return Response(DASHBOARD_HTML,mimetype="text/html")
+def dashboard():return Response(DASHBOARD_HTML,mimetype="text/html")
 
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML="""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -668,7 +719,6 @@ body{background:var(--bg);color:var(--txt);font-family:'Rajdhani',sans-serif;pad
 body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(240,165,0,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(240,165,0,.018) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(0,230,118,.4)}70%{box-shadow:0 0 0 8px rgba(0,230,118,0)}}
-@keyframes spin{to{transform:rotate(360deg)}}
 .hdr{position:sticky;top:0;z-index:100;background:linear-gradient(180deg,#080d12,rgba(6,10,14,.98));border-bottom:2px solid var(--gold);padding:10px 14px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 4px 32px rgba(240,165,0,.2);}
 .logo{font-family:'Orbitron';font-size:12px;font-weight:900;color:var(--gold);letter-spacing:2px;}
 .logo small{display:block;font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-top:2px;}
@@ -680,6 +730,7 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .sdot{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:middle;}
 .sdot.ok{background:var(--grn);animation:pulse 2s infinite;}
 .sdot.wait{background:var(--gold);animation:blink 1s infinite;}
+.sdot.err{background:var(--red);}
 .main{padding:10px;max-width:480px;margin:0 auto;position:relative;z-index:1;}
 .banner{background:linear-gradient(135deg,rgba(240,165,0,.07),rgba(240,165,0,.02));border:1px solid rgba(240,165,0,.3);border-radius:11px;padding:10px 14px;margin-bottom:9px;text-align:center;}
 .btitle{font-family:'Orbitron';font-size:16px;font-weight:900;color:var(--gold);letter-spacing:3px;}
@@ -693,15 +744,15 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .badge{display:inline-flex;padding:1px 7px;border-radius:8px;font-family:'Share Tech Mono';font-size:7px;}
 .badge.live{background:rgba(0,230,118,.1);border:1px solid rgba(0,230,118,.3);color:var(--grn);}
 .badge.wait{background:rgba(41,182,246,.08);border:1px solid rgba(41,182,246,.2);color:var(--blu);}
-.badge.err{background:rgba(255,23,68,.08);border:1px solid rgba(255,23,68,.2);color:var(--red);}
 .inp{width:100%;background:var(--bg3);border:1px solid var(--brd);border-radius:6px;color:var(--txt);padding:8px 10px;font-size:12px;font-family:'Share Tech Mono';outline:none;margin-bottom:6px;}
 .inp:focus{border-color:var(--orn);}
 .inp-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:.5px;margin-bottom:3px;}
 .cbtn{width:100%;padding:11px;border-radius:8px;cursor:pointer;font-family:'Orbitron';font-size:9px;font-weight:700;letter-spacing:1px;border:1px solid var(--orn);background:rgba(255,152,0,.08);color:var(--orn);margin-top:6px;}
 .cbtn.pur{border-color:var(--pur);background:rgba(206,147,216,.08);color:var(--pur);}
 .cbtn.grn{border-color:var(--grn);background:rgba(0,230,118,.08);color:var(--grn);}
+.cbtn:disabled{opacity:.4;cursor:not-allowed;}
 .idx-row{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:9px;}
-.ib{background:var(--bg3);border:2px solid var(--brd);border-radius:9px;padding:9px;text-align:center;cursor:pointer;transition:.2s;}
+.ib{background:var(--bg3);border:2px solid var(--brd);border-radius:9px;padding:9px;text-align:center;cursor:pointer;}
 .ib.on{border-color:var(--gold);}
 .ib-name{font-family:'Orbitron';font-size:13px;font-weight:900;}
 .ib.on .ib-name{color:var(--gold);}
@@ -711,7 +762,6 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .mc{background:var(--bg2);border:1px solid var(--brd);border-radius:8px;padding:7px;text-align:center;}
 .mc-n{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:2px;}
 .mc-v{font-family:'Orbitron';font-size:13px;font-weight:700;}
-.mc-c{font-family:'Share Tech Mono';font-size:8px;margin-top:1px;}
 .oi-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:9px;}
 .oi-cell{background:var(--bg3);border-radius:7px;padding:8px;text-align:center;border:1px solid var(--brd);}
 .oi-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:2px;}
@@ -728,13 +778,12 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .sr-lbl{font-family:'Share Tech Mono';font-size:7px;letter-spacing:.5px;margin-bottom:2px;}
 .sr-val{font-family:'Orbitron';font-size:14px;font-weight:700;}
 .prem-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:9px;}
-.prem-cell{background:var(--bg3);border-radius:8px;padding:9px;border:2px solid var(--brd);text-align:center;transition:.3s;}
+.prem-cell{background:var(--bg3);border-radius:8px;padding:9px;border:2px solid var(--brd);text-align:center;}
 .ptype{font-family:'Orbitron';font-size:10px;font-weight:700;margin-bottom:3px;}
 .pval{font-family:'Orbitron';font-size:22px;font-weight:700;}
 .pchg{font-family:'Share Tech Mono';font-size:9px;margin-top:2px;}
-.ag-sect{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:2px;margin:8px 0 5px;}
 .ag-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:4px;}
-.agc{background:var(--bg3);border:1px solid var(--brd);border-radius:8px;padding:8px;position:relative;overflow:hidden;transition:.3s;}
+.agc{background:var(--bg3);border:1px solid var(--brd);border-radius:8px;padding:8px;position:relative;overflow:hidden;}
 .agc::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--brd);}
 .agc.bull::before{background:var(--grn);}
 .agc.bear::before{background:var(--red);}
@@ -746,39 +795,28 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .ag-name{font-size:10px;font-weight:700;margin-bottom:2px;}
 .ag-val{font-family:'Share Tech Mono';font-size:8px;color:var(--dim);line-height:1.3;}
 .ag-conf{font-family:'Share Tech Mono';font-size:7px;color:var(--blu);margin-top:2px;}
-.ag-w{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);}
 .nambi-box{border-radius:13px;padding:16px;margin-bottom:9px;border:2px solid var(--brd);transition:all .4s;}
 .nambi-box.buy-ce{border-color:rgba(0,230,118,.6);background:linear-gradient(135deg,rgba(0,230,118,.08),rgba(0,230,118,.01));box-shadow:0 0 40px rgba(0,230,118,.15);}
 .nambi-box.buy-pe{border-color:rgba(255,23,68,.6);background:linear-gradient(135deg,rgba(255,23,68,.08),rgba(255,23,68,.01));box-shadow:0 0 40px rgba(255,23,68,.15);}
-.nambi-box.wait{border-color:rgba(240,165,0,.5);background:linear-gradient(135deg,rgba(240,165,0,.07),rgba(240,165,0,.01));}
+.nambi-box.wait{border-color:rgba(240,165,0,.5);}
 .nambi-box.idle{background:var(--bg2);}
 .nambi-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:3px;margin-bottom:5px;}
-.nambi-sig{font-family:'Orbitron';font-size:30px;font-weight:900;margin-bottom:3px;letter-spacing:2px;}
+.nambi-sig{font-family:'Orbitron';font-size:30px;font-weight:900;margin-bottom:3px;}
 .nambi-conf{font-family:'Share Tech Mono';font-size:10px;color:var(--dim);margin-bottom:10px;}
 .conf-track{height:12px;border-radius:6px;background:rgba(255,255,255,.05);overflow:hidden;display:flex;margin-bottom:5px;}
 .conf-bull{height:100%;background:linear-gradient(90deg,#003d2e,var(--grn));transition:width .7s;}
 .conf-bear{height:100%;background:linear-gradient(90deg,var(--red),#5a0000);transition:width .7s;}
 .conf-pct{display:flex;justify-content:space-between;font-family:'Share Tech Mono';font-size:9px;margin-bottom:9px;}
 .reason-list{background:var(--bg3);border-radius:8px;padding:9px;}
-.reason-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:1px;margin-bottom:5px;}
-.reason-item{font-family:'Share Tech Mono';font-size:8px;padding:4px 0;border-bottom:1px solid rgba(30,45,61,.5);color:var(--txt);line-height:1.4;}
+.reason-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:5px;}
+.reason-item{font-family:'Share Tech Mono';font-size:8px;padding:4px 0;border-bottom:1px solid rgba(30,45,61,.5);line-height:1.4;}
 .reason-item:last-child{border:none;}
-.eng-row{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:9px;}
-.eng-cell{background:var(--bg3);border:1px solid var(--brd);border-radius:9px;padding:9px;text-align:center;}
-.eng-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:1px;margin-bottom:4px;}
-.eng-val{font-family:'Orbitron';font-size:11px;font-weight:700;margin-bottom:3px;}
-.eng-r{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);line-height:1.3;}
-.l17-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:9px;}
-.l17c{background:var(--bg3);border-radius:7px;padding:6px;text-align:center;border:1px solid var(--brd);}
-.l17n{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:2px;}
-.l17v{font-family:'Orbitron';font-size:14px;font-weight:700;}
-.ccs-item{background:var(--bg3);border-left:2px solid var(--brd);border-radius:0 6px 6px 0;padding:5px 8px;margin-bottom:4px;font-family:'Share Tech Mono';font-size:8px;}
 .tabs{display:flex;gap:4px;margin-bottom:9px;overflow-x:auto;}
 .tab{padding:5px 12px;border-radius:6px;cursor:pointer;font-family:'Orbitron';font-size:8px;letter-spacing:1px;border:1px solid var(--brd);background:var(--bg3);color:var(--dim);white-space:nowrap;flex-shrink:0;}
 .tab.on{border-color:var(--gold);color:var(--gold);background:rgba(240,165,0,.08);}
 .tc{display:none;}.tc.on{display:block;}
-.status-msg{background:rgba(41,182,246,.07);border:1px solid rgba(41,182,246,.2);border-radius:7px;padding:8px 11px;margin-bottom:9px;font-family:'Share Tech Mono';font-size:9px;color:var(--blu);display:none;}
-.wsbar{position:fixed;bottom:0;left:0;right:0;z-index:200;padding:4px 12px;font-family:'Share Tech Mono';font-size:9px;background:var(--bg2);border-top:1px solid var(--brd);display:flex;align-items:center;gap:6px;}
+.status-msg{border-radius:7px;padding:8px 11px;margin-bottom:9px;font-family:'Share Tech Mono';font-size:10px;display:none;text-align:center;font-weight:700;}
+.wsbar{position:fixed;bottom:0;left:0;right:0;z-index:200;padding:5px 12px;font-family:'Share Tech Mono';font-size:9px;background:var(--bg2);border-top:1px solid var(--brd);display:flex;align-items:center;gap:6px;}
 .wsdot{width:7px;height:7px;border-radius:50%;background:var(--red);flex-shrink:0;}
 .wsdot.on{background:var(--grn);animation:pulse 2s infinite;}
 .auto-row{display:flex;justify-content:space-between;align-items:center;background:var(--bg2);border:1px solid var(--brd);border-radius:7px;padding:7px 11px;margin-bottom:9px;font-family:'Share Tech Mono';font-size:9px;}
@@ -786,12 +824,22 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 .tog.on{background:rgba(0,230,118,.2);border-color:var(--grn);}
 .tog-dot{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--dim);transition:.2s;}
 .tog.on .tog-dot{left:18px;background:var(--grn);}
-.go-btn{width:100%;padding:13px;border-radius:11px;border:none;cursor:pointer;background:linear-gradient(135deg,#7a5200,var(--gold),#f5c540);color:#000;font-family:'Orbitron';font-size:11px;font-weight:900;letter-spacing:2px;box-shadow:0 6px 28px rgba(240,165,0,.3);margin-bottom:9px;}
-.go-btn:disabled{background:#1a2230;color:var(--dim);box-shadow:none;}
+.go-btn{width:100%;padding:13px;border-radius:11px;border:none;cursor:pointer;background:linear-gradient(135deg,#7a5200,var(--gold),#f5c540);color:#000;font-family:'Orbitron';font-size:11px;font-weight:900;letter-spacing:2px;margin-bottom:9px;}
+.go-btn:disabled{background:#1a2230;color:var(--dim);}
 .ki{width:100%;background:var(--bg3);border:1px solid var(--brd);border-radius:6px;color:var(--grn);padding:8px;font-size:12px;font-family:'Share Tech Mono';outline:none;}
 .claude-box{background:var(--bg2);border:1px solid rgba(240,165,0,.2);border-radius:11px;padding:12px;margin-bottom:9px;}
-.claude-title{font-family:'Orbitron';font-size:8px;color:var(--gold);letter-spacing:1.5px;margin-bottom:8px;}
-.claude-text{font-size:13px;line-height:1.9;color:var(--txt);}
+.claude-title{font-family:'Orbitron';font-size:8px;color:var(--gold);margin-bottom:8px;}
+.claude-text{font-size:13px;line-height:1.9;}
+.ag-sect{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);letter-spacing:2px;margin:8px 0 5px;}
+.l17-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:5px;margin-bottom:9px;}
+.l17c{background:var(--bg3);border-radius:7px;padding:6px;text-align:center;border:1px solid var(--brd);}
+.l17n{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:2px;}
+.l17v{font-family:'Orbitron';font-size:14px;font-weight:700;}
+.eng-row{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:9px;}
+.eng-cell{background:var(--bg3);border:1px solid var(--brd);border-radius:9px;padding:9px;text-align:center;}
+.eng-lbl{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:4px;}
+.eng-val{font-family:'Orbitron';font-size:11px;font-weight:700;margin-bottom:3px;}
+.eng-r{font-family:'Share Tech Mono';font-size:7px;color:var(--dim);line-height:1.3;}
 </style></head>
 <body>
 <div class="hdr">
@@ -802,7 +850,7 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
   </div>
 </div>
 <div class="sbar">
-  <div><span class="sdot wait" id="sdot"></span><span id="stxt" style="color:var(--gold)">Connecting...</span></div>
+  <div><span class="sdot wait" id="sdot"></span><span id="stxt" style="color:var(--gold)">Loading...</span></div>
   <span id="rtxt" style="color:var(--dim)">IST</span>
 </div>
 <div class="main">
@@ -817,19 +865,19 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
   <div class="tab on" onclick="ST('market',this)">📊 MARKET</div>
   <div class="tab" onclick="ST('agents',this)">🤖 AGENTS</div>
   <div class="tab" onclick="ST('engines',this)">⚙️ ENGINES</div>
-  <div class="tab" onclick="ST('ccs',this)">📡 CCS</div>
   <div class="tab" onclick="ST('setup',this)">🔧 SETUP</div>
 </div>
 
+<!-- MARKET -->
 <div class="tc on" id="tc-market">
   <div class="idx-row">
     <div class="ib on" id="ib-NIFTY" onclick="setIdx('NIFTY')"><div class="ib-name">NIFTY 50</div><div class="ib-spot" id="n-spot">—</div><div class="ib-atm" id="n-atm">ATM: —</div></div>
     <div class="ib" id="ib-SENSEX" onclick="setIdx('SENSEX')"><div class="ib-name">SENSEX</div><div class="ib-spot" id="s-spot">—</div><div class="ib-atm" id="s-atm">ATM: —</div></div>
   </div>
   <div class="mstrip">
-    <div class="mc"><div class="mc-n">SPOT</div><div class="mc-v" id="nv" style="color:var(--grn)">—</div><div class="mc-c" id="nc">—</div></div>
-    <div class="mc"><div class="mc-n">VIX</div><div class="mc-v" id="vv" style="color:var(--gold)">—</div><div class="mc-c" id="vn">—</div></div>
-    <div class="mc"><div class="mc-n">CYCLE</div><div class="mc-v" id="cyc" style="color:var(--pur)">0</div><div class="mc-c" id="ft" style="color:var(--dim)">—</div></div>
+    <div class="mc"><div class="mc-n">SPOT</div><div class="mc-v" id="nv" style="color:var(--grn)">—</div></div>
+    <div class="mc"><div class="mc-n">VIX</div><div class="mc-v" id="vv" style="color:var(--gold)">—</div></div>
+    <div class="mc"><div class="mc-n">CYCLE</div><div class="mc-v" id="cyc" style="color:var(--pur)">0</div></div>
   </div>
   <div class="card">
     <div class="ctitle">OI ANALYSIS <span class="badge wait" id="oi-badge">LOADING</span></div>
@@ -840,7 +888,7 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
     <div class="pcr-wrap">
       <div class="pcr-lbl"><span>PCR</span><span id="pcrVal" style="color:var(--gold)">—</span></div>
       <div class="pcr-bg"><div class="pcr-fill" id="pcrFill" style="width:50%;background:var(--gold)"></div></div>
-      <div class="pcr-marks"><span>BEAR&lt;0.8</span><span>NEUTRAL 1.0</span><span>BULL&gt;1.2</span></div>
+      <div class="pcr-marks"><span>BEAR&lt;0.8</span><span>1.0</span><span>BULL&gt;1.2</span></div>
     </div>
     <div class="sr-row">
       <div class="sr-cell sr-sup"><div class="sr-lbl" style="color:var(--grn)">SUPPORT</div><div class="sr-val" id="sup" style="color:var(--grn)">—</div><div style="font-family:'Share Tech Mono';font-size:7px;color:var(--dim)" id="supOI">—</div></div>
@@ -850,8 +898,8 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
   <div class="card">
     <div class="ctitle">ATM PREMIUM</div>
     <div class="prem-grid">
-      <div class="prem-cell" id="ce-cell"><div class="ptype" style="color:var(--grn)">CALL CE</div><div class="pval" id="ceVal" style="color:var(--grn)">—</div><div class="pchg" id="ceChg">—</div></div>
-      <div class="prem-cell" id="pe-cell"><div class="ptype" style="color:var(--red)">PUT PE</div><div class="pval" id="peVal" style="color:var(--red)">—</div><div class="pchg" id="peChg">—</div></div>
+      <div class="prem-cell"><div class="ptype" style="color:var(--grn)">CALL CE</div><div class="pval" id="ceVal" style="color:var(--grn)">—</div><div class="pchg" id="ceChg">—</div></div>
+      <div class="prem-cell"><div class="ptype" style="color:var(--red)">PUT PE</div><div class="pval" id="peVal" style="color:var(--red)">—</div><div class="pchg" id="peChg">—</div></div>
     </div>
   </div>
   <div class="nambi-box idle" id="nambi-box">
@@ -862,40 +910,41 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
     <div class="conf-pct"><span id="bull-pct" style="color:var(--grn)">BULL 50%</span><span id="bear-pct" style="color:var(--red)">BEAR 50%</span></div>
     <div class="reason-list" id="reason-list" style="display:none"><div class="reason-lbl">SIGNAL SOURCES</div><div id="reasons"></div></div>
   </div>
-  <div class="auto-row"><span>Auto refresh 10s</span><div class="tog on" id="auto-tog" onclick="toggleAuto()"><div class="tog-dot"></div></div></div>
-  <button style="width:100%;padding:9px;border-radius:9px;cursor:pointer;border:1px solid rgba(41,182,246,.4);background:rgba(41,182,246,.05);color:var(--blu);font-family:'Orbitron';font-size:9px;letter-spacing:1px;margin-bottom:9px;" onclick="doFetch()">⟳ FETCH LIVE DATA NOW</button>
+  <div class="auto-row"><span>Auto refresh 5s</span><div class="tog on" id="auto-tog" onclick="toggleAuto()"><div class="tog-dot"></div></div></div>
+  <button style="width:100%;padding:9px;border-radius:9px;cursor:pointer;border:1px solid rgba(41,182,246,.4);background:rgba(41,182,246,.05);color:var(--blu);font-family:'Orbitron';font-size:9px;letter-spacing:1px;margin-bottom:9px;" onclick="fetchNow()">⟳ FETCH LIVE DATA NOW</button>
 </div>
 
+<!-- AGENTS -->
 <div class="tc" id="tc-agents">
   <div class="ag-sect">OI + PRICE + MACRO</div>
   <div class="ag-grid">
-    <div class="agc" id="ag-l1"><div class="ag-top"><span class="ag-id">L1</span><span class="ag-sig none" id="sig-l1">—</span></div><div class="ag-name">OI Analyst</div><div class="ag-val" id="det-l1">—</div><div class="ag-conf" id="conf-l1"></div><div class="ag-w" id="w-l1"></div></div>
-    <div class="agc" id="ag-l2"><div class="ag-top"><span class="ag-id">L2</span><span class="ag-sig none" id="sig-l2">—</span></div><div class="ag-name">Price Action</div><div class="ag-val" id="det-l2">—</div><div class="ag-conf" id="conf-l2"></div><div class="ag-w" id="w-l2"></div></div>
-    <div class="agc" id="ag-l3"><div class="ag-top"><span class="ag-id">L3</span><span class="ag-sig none" id="sig-l3">—</span></div><div class="ag-name">VIX Monitor</div><div class="ag-val" id="det-l3">—</div><div class="ag-conf" id="conf-l3"></div><div class="ag-w" id="w-l3"></div></div>
-    <div class="agc" id="ag-l4"><div class="ag-top"><span class="ag-id">L4</span><span class="ag-sig none" id="sig-l4">—</span></div><div class="ag-name">GIFT Tracker</div><div class="ag-val" id="det-l4">—</div><div class="ag-conf" id="conf-l4"></div><div class="ag-w" id="w-l4"></div></div>
+    <div class="agc" id="ag-l1"><div class="ag-top"><span class="ag-id">L1</span><span class="ag-sig none" id="sig-l1">—</span></div><div class="ag-name">OI Analyst</div><div class="ag-val" id="det-l1">—</div><div class="ag-conf" id="conf-l1"></div></div>
+    <div class="agc" id="ag-l2"><div class="ag-top"><span class="ag-id">L2</span><span class="ag-sig none" id="sig-l2">—</span></div><div class="ag-name">Price Action</div><div class="ag-val" id="det-l2">—</div><div class="ag-conf" id="conf-l2"></div></div>
+    <div class="agc" id="ag-l3"><div class="ag-top"><span class="ag-id">L3</span><span class="ag-sig none" id="sig-l3">—</span></div><div class="ag-name">VIX Monitor</div><div class="ag-val" id="det-l3">—</div><div class="ag-conf" id="conf-l3"></div></div>
+    <div class="agc" id="ag-l4"><div class="ag-top"><span class="ag-id">L4</span><span class="ag-sig none" id="sig-l4">—</span></div><div class="ag-name">GIFT Tracker</div><div class="ag-val" id="det-l4">—</div><div class="ag-conf" id="conf-l4"></div></div>
   </div>
   <div class="ag-sect">PREMIUM + SESSION</div>
   <div class="ag-grid">
-    <div class="agc" id="ag-l5"><div class="ag-top"><span class="ag-id">L5</span><span class="ag-sig none" id="sig-l5">—</span></div><div class="ag-name">CE Premium</div><div class="ag-val" id="det-l5">—</div><div class="ag-conf" id="conf-l5"></div><div class="ag-w" id="w-l5"></div></div>
-    <div class="agc" id="ag-l6"><div class="ag-top"><span class="ag-id">L6</span><span class="ag-sig none" id="sig-l6">—</span></div><div class="ag-name">PE Premium</div><div class="ag-val" id="det-l6">—</div><div class="ag-conf" id="conf-l6"></div><div class="ag-w" id="w-l6"></div></div>
-    <div class="agc" id="ag-l7"><div class="ag-top"><span class="ag-id">L7</span><span class="ag-sig none" id="sig-l7">—</span></div><div class="ag-name">Session Clock</div><div class="ag-val" id="det-l7">—</div><div class="ag-conf" id="conf-l7"></div><div class="ag-w" id="w-l7"></div></div>
-    <div class="agc" id="ag-l8"><div class="ag-top"><span class="ag-id">L8</span><span class="ag-sig none" id="sig-l8">—</span></div><div class="ag-name">Expiry Watcher</div><div class="ag-val" id="det-l8">—</div><div class="ag-conf" id="conf-l8"></div><div class="ag-w" id="w-l8"></div></div>
+    <div class="agc" id="ag-l5"><div class="ag-top"><span class="ag-id">L5</span><span class="ag-sig none" id="sig-l5">—</span></div><div class="ag-name">CE Premium</div><div class="ag-val" id="det-l5">—</div><div class="ag-conf" id="conf-l5"></div></div>
+    <div class="agc" id="ag-l6"><div class="ag-top"><span class="ag-id">L6</span><span class="ag-sig none" id="sig-l6">—</span></div><div class="ag-name">PE Premium</div><div class="ag-val" id="det-l6">—</div><div class="ag-conf" id="conf-l6"></div></div>
+    <div class="agc" id="ag-l7"><div class="ag-top"><span class="ag-id">L7</span><span class="ag-sig none" id="sig-l7">—</span></div><div class="ag-name">Session Clock</div><div class="ag-val" id="det-l7">—</div><div class="ag-conf" id="conf-l7"></div></div>
+    <div class="agc" id="ag-l8"><div class="ag-top"><span class="ag-id">L8</span><span class="ag-sig none" id="sig-l8">—</span></div><div class="ag-name">Expiry Watcher</div><div class="ag-val" id="det-l8">—</div><div class="ag-conf" id="conf-l8"></div></div>
   </div>
   <div class="ag-sect">BEHAVIOUR + INTELLIGENCE</div>
   <div class="ag-grid">
-    <div class="agc" id="ag-l9"><div class="ag-top"><span class="ag-id">L9</span><span class="ag-sig none" id="sig-l9">—</span></div><div class="ag-name">Gap Detector</div><div class="ag-val" id="det-l9">—</div><div class="ag-conf" id="conf-l9"></div><div class="ag-w" id="w-l9"></div></div>
-    <div class="agc" id="ag-l10"><div class="ag-top"><span class="ag-id">L10</span><span class="ag-sig none" id="sig-l10">—</span></div><div class="ag-name">PCR Engine</div><div class="ag-val" id="det-l10">—</div><div class="ag-conf" id="conf-l10"></div><div class="ag-w" id="w-l10"></div></div>
-    <div class="agc" id="ag-l11"><div class="ag-top"><span class="ag-id">L11</span><span class="ag-sig none" id="sig-l11">—</span></div><div class="ag-name">Trap Detector</div><div class="ag-val" id="det-l11">—</div><div class="ag-conf" id="conf-l11"></div><div class="ag-w" id="w-l11"></div></div>
-    <div class="agc" id="ag-l12"><div class="ag-top"><span class="ag-id">L12</span><span class="ag-sig none" id="sig-l12">—</span></div><div class="ag-name">Risk Control</div><div class="ag-val" id="det-l12">—</div><div class="ag-conf" id="conf-l12"></div><div class="ag-w" id="w-l12"></div></div>
+    <div class="agc" id="ag-l9"><div class="ag-top"><span class="ag-id">L9</span><span class="ag-sig none" id="sig-l9">—</span></div><div class="ag-name">Gap Detector</div><div class="ag-val" id="det-l9">—</div><div class="ag-conf" id="conf-l9"></div></div>
+    <div class="agc" id="ag-l10"><div class="ag-top"><span class="ag-id">L10</span><span class="ag-sig none" id="sig-l10">—</span></div><div class="ag-name">PCR Engine</div><div class="ag-val" id="det-l10">—</div><div class="ag-conf" id="conf-l10"></div></div>
+    <div class="agc" id="ag-l11"><div class="ag-top"><span class="ag-id">L11</span><span class="ag-sig none" id="sig-l11">—</span></div><div class="ag-name">Trap Detector</div><div class="ag-val" id="det-l11">—</div><div class="ag-conf" id="conf-l11"></div></div>
+    <div class="agc" id="ag-l12"><div class="ag-top"><span class="ag-id">L12</span><span class="ag-sig none" id="sig-l12">—</span></div><div class="ag-name">Risk Control</div><div class="ag-val" id="det-l12">—</div><div class="ag-conf" id="conf-l12"></div></div>
   </div>
   <div class="ag-sect">L13 · MASTER BEHAVIOUR AI</div>
   <div class="agc" id="ag-l13" style="padding:10px;margin-bottom:9px;">
     <div class="ag-top"><span class="ag-id" style="font-size:9px">L13</span><span class="ag-sig none" id="sig-l13" style="font-size:12px">—</span></div>
     <div class="ag-name" style="font-size:12px;margin-bottom:4px">Behaviour AI</div>
-    <div class="ag-val" id="det-l13">—</div><div class="ag-conf" id="conf-l13"></div><div class="ag-w" id="w-l13"></div>
+    <div class="ag-val" id="det-l13">—</div><div class="ag-conf" id="conf-l13"></div>
   </div>
   <div class="card">
-    <div class="ctitle">L17 · SELF LEARNING ENGINE</div>
+    <div class="ctitle">L17 · SELF LEARNING</div>
     <div class="l17-row">
       <div class="l17c"><div class="l17n">TRADES</div><div class="l17v" id="l17t" style="color:var(--gold)">0</div></div>
       <div class="l17c"><div class="l17n">WINS</div><div class="l17v" id="l17w" style="color:var(--grn)">0</div></div>
@@ -905,41 +954,35 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
   </div>
 </div>
 
+<!-- ENGINES -->
 <div class="tc" id="tc-engines">
   <div class="eng-row">
-    <div class="eng-cell"><div class="eng-lbl">L15 · TRUTH ENGINE</div><div class="eng-val" id="l15v" style="color:var(--dim)">—</div><div class="eng-r" id="l15r">Awaiting</div><div style="font-family:'Share Tech Mono';font-size:7px;color:var(--blu);margin-top:3px" id="l15c"></div></div>
-    <div class="eng-cell"><div class="eng-lbl">L16 · CONTRADICTION</div><div class="eng-val" id="l16v" style="color:var(--dim)">—</div><div class="eng-r" id="l16a">Awaiting</div><div style="font-family:'Share Tech Mono';font-size:7px;color:var(--blu);margin-top:3px" id="l16c"></div></div>
+    <div class="eng-cell"><div class="eng-lbl">L15 · TRUTH</div><div class="eng-val" id="l15v" style="color:var(--dim)">—</div><div class="eng-r" id="l15r">Awaiting</div></div>
+    <div class="eng-cell"><div class="eng-lbl">L16 · CONTRADICTION</div><div class="eng-val" id="l16v" style="color:var(--dim)">—</div><div class="eng-r" id="l16a">Awaiting</div></div>
   </div>
-  <div class="card"><div class="ctitle">L16 DETAIL</div><div style="font-family:'Share Tech Mono';font-size:9px;color:var(--txt);line-height:1.6" id="l16d">—</div></div>
+  <div class="card"><div class="ctitle">L16 DETAIL</div><div style="font-family:'Share Tech Mono';font-size:9px;line-height:1.6" id="l16d">—</div></div>
   <div class="card">
     <div class="ctitle">SYSTEM STATUS</div>
-    <div style="font-family:'Share Tech Mono';font-size:9px;line-height:1.8">
+    <div style="font-family:'Share Tech Mono';font-size:9px;line-height:1.9">
       <div>Angel: <span id="sys-angel" style="color:var(--dim)">—</span></div>
       <div>WebSocket: <span id="sys-ws" style="color:var(--dim)">—</span></div>
       <div>Source: <span id="sys-src" style="color:var(--dim)">—</span></div>
       <div>Last fetch: <span id="sys-ft" style="color:var(--dim)">—</span></div>
+      <div>Angel Error: <span id="sys-err" style="color:var(--red)">—</span></div>
     </div>
   </div>
 </div>
 
-<div class="tc" id="tc-ccs">
-  <div class="card">
-    <div class="ctitle">CCS · COMMAND CONTROL SYSTEM
-      <button onclick="wsSend({type:'get_ccs_log'})" style="padding:3px 8px;border-radius:4px;cursor:pointer;border:1px solid var(--brd);background:var(--bg3);color:var(--dim);font-family:'Share Tech Mono';font-size:7px">REFRESH</button>
-    </div>
-    <div id="ccs-log" style="max-height:400px;overflow-y:auto"></div>
-  </div>
-</div>
-
+<!-- SETUP -->
 <div class="tc" id="tc-setup">
   <div class="card" style="border-color:rgba(206,147,216,.3)">
     <div class="ctitle" style="color:var(--pur)">ANGEL ONE <span id="angel-st" style="font-family:'Share Tech Mono';font-size:8px;color:var(--dim)">NOT SET</span></div>
-    <div style="font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:8px">Saved in DB. Auto-loads on restart.</div>
+    <div style="font-family:'Share Tech Mono';font-size:7px;color:var(--dim);margin-bottom:8px">Credentials saved in server DB. Auto-loads on restart.</div>
     <div class="inp-lbl">API KEY</div><input class="inp" id="api-key" type="password" placeholder="API Key"/>
     <div class="inp-lbl">CLIENT ID</div><input class="inp" id="client-id" type="text" placeholder="A12345"/>
-    <div class="inp-lbl">PIN</div><input class="inp" id="angel-pin" type="password" placeholder="1234"/>
+    <div class="inp-lbl">PIN (4-digit)</div><input class="inp" id="angel-pin" type="password" placeholder="1234"/>
     <div class="inp-lbl">TOTP SECRET</div><input class="inp" id="totp-secret" type="password" placeholder="JBSWY3DPEHPK3PXP"/>
-    <button class="cbtn pur" onclick="connectAngel()">CONNECT ANGEL ONE</button>
+    <button class="cbtn pur" id="connect-btn" onclick="connectAngel()">CONNECT ANGEL ONE</button>
   </div>
   <div class="card" style="border-color:rgba(41,182,246,.2)">
     <div class="ctitle" style="color:var(--blu)">TELEGRAM <span id="tg-st" style="font-family:'Share Tech Mono';font-size:8px;color:var(--dim)">OFF</span></div>
@@ -949,9 +992,8 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
   </div>
   <div class="card">
     <div class="ctitle">CAPITAL</div>
-    <div class="inp-lbl">TRADING CAPITAL (₹)</div>
     <input class="inp" id="cap-inp" type="number" placeholder="10000" value="10000"/>
-    <button class="cbtn grn" onclick="saveCap()">SAVE</button>
+    <button class="cbtn grn" onclick="saveCap()">SAVE CAPITAL</button>
   </div>
   <div class="card" style="border-color:rgba(240,165,0,.2)">
     <div class="ctitle" style="color:var(--gold)">CLAUDE AI KEY</div>
@@ -967,11 +1009,11 @@ body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(2
 </div>
 </div>
 
-<div class="wsbar"><div class="wsdot" id="wsdot"></div><span id="ws-txt">Connecting...</span><span id="ws-info" style="margin-left:auto;color:var(--dim)"></span></div>
+<div class="wsbar"><div class="wsdot" id="wsdot"></div><span id="ws-txt">Connecting...</span><span id="ws-info" style="margin-left:auto;color:var(--dim)" id="poll-info"></span></div>
 
 <script>
-const WS_URL=location.origin.replace(/^http/,'ws')+'/ws';
-let ws=null,ok=false,rcD=1000,rcT=null,hbT=null,wdT=null,hbM=0,conn=false,autoOn=true,SS={};
+// ── PURE REST POLLING — No WebSocket dependency ───────────────────
+let autoOn=true,polling=null,SS={},pollCount=0;
 
 function ST(id,el){
   document.querySelectorAll('.tc').forEach(e=>e.className='tc');
@@ -979,53 +1021,107 @@ function ST(id,el){
   document.getElementById('tc-'+id).className='tc on';
   el.className='tab on';
 }
-function son(){ok=true;hbM=0;rcD=1000;conn=false;q('wsdot').className='wsdot on';q('live-badge').className='hlive on';q('live-badge').textContent='LIVE';wst('Connected');}
-function soff(r){ok=false;q('wsdot').className='wsdot';q('live-badge').className='hlive off';q('live-badge').textContent='OFFLINE';wst(r||'Offline');}
-function stT(){clearInterval(hbT);hbT=null;clearInterval(wdT);wdT=null;clearTimeout(rcT);rcT=null;}
-function sC(){if(!ws)return;try{ws.onopen=ws.onmessage=ws.onerror=ws.onclose=null;if(ws.readyState<=1)ws.close();}catch(e){}ws=null;}
-function schedRC(){if(rcT)return;soff('Reconnecting '+Math.round(rcD/1000)+'s...');rcT=setTimeout(()=>{rcT=null;connect();rcD=Math.min(rcD*2,10000);},rcD);}
-function startHB(){stT();hbM=0;
-  hbT=setInterval(()=>{if(!ws||ws.readyState!==1){stT();schedRC();return;}ws.send(JSON.stringify({type:'ping'}));hbM++;if(hbM>=3){stT();sC();schedRC();}},3000);
-  wdT=setInterval(()=>{if(!ws||ws.readyState!==1){stT();sC();schedRC();}},5000);}
-function connect(){
-  if(conn)return;if(ws&&ws.readyState===1)return;
-  conn=true;sC();wst('Connecting...');
-  try{ws=new WebSocket(WS_URL);}catch(e){conn=false;schedRC();return;}
-  const ot=setTimeout(()=>{if(!ws||ws.readyState!==1){conn=false;sC();schedRC();}},8000);
-  ws.onopen=()=>{clearTimeout(ot);son();startHB();try{ws.send(JSON.stringify({type:'get_state'}));}catch(e){}};
-  ws.onmessage=(e)=>{hbM=0;let m;try{m=JSON.parse(e.data);}catch{return;}handle(m);};
-  ws.onerror=()=>{clearTimeout(ot);conn=false;stT();sC();schedRC();};
-  ws.onclose=(e)=>{clearTimeout(ot);conn=false;stT();soff('DC('+e.code+')');schedRC();};}
-function wsSend(o){
-  if(ws&&ws.readyState===1){ws.send(JSON.stringify(o));return;}
-  if(o.type==='connect_angel'){fetch('/connect_angel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).catch(()=>{});}
+
+async function pollState(){
+  try{
+    const r=await fetch('/api/state',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const s=await r.json();
+    pollCount++;
+    q('wsdot').className='wsdot on';
+    q('live-badge').className='hlive on';q('live-badge').textContent='LIVE';
+    q('ws-txt').textContent='Connected — Poll #'+pollCount;
+    q('sdot').className='sdot ok';
+    applyState(s);
+  }catch(e){
+    q('wsdot').className='wsdot';
+    q('live-badge').className='hlive off';q('live-badge').textContent='OFFLINE';
+    q('ws-txt').textContent='Reconnecting...';
+    q('sdot').className='sdot wait';
+    q('stxt').textContent='Server sleeping — retrying...';
+  }
 }
 
-function handle(m){
-  const t=m.type;
-  if(t==='pong')return;
-  if(t==='heartbeat'){
-    t_('sys-angel',m.angel?'✅ Connected':'❌ Not connected');
-    t_('sys-ws',m.ws?'✅ Live':'❌ Stopped');
-    t_('cyc',m.count||0);return;}
-  if(t==='full_state'){applyState(m.state);return;}
-  if(t==='nambi_update'){applyNambi(m.nambi);return;}
-  if(t==='angel_ok'){showMsg('✅ Angel One: '+m.client,'grn');t_('angel-st','✅ '+m.client);return;}
-  if(t==='angel_err'){showMsg('❌ '+m.msg,'red');return;}
-  if(t==='angel_ws_connected'){showMsg('✅ WebSocket live — OI streaming','grn');t_('oi-badge','LIVE');q('oi-badge').className='badge live';return;}
-  if(t==='angel_ws_error'){showMsg('⚠️ WS error: '+m.error,'orn');return;}
-  if(t==='status_msg'){showMsg(m.msg,'blu');return;}
-  if(t==='tg_ok'){t_('tg-st','✅ ON');showMsg('Telegram connected!','grn');return;}
-  if(t==='ccs_event'){appendCCS(m.event);return;}
-  if(t==='ccs_history'){renderCCS(m.events);return;}
+function startPolling(){
+  if(polling)clearInterval(polling);
+  pollState();
+  polling=setInterval(()=>{if(autoOn)pollState();},5000);
+}
+
+function toggleAuto(){
+  autoOn=!autoOn;
+  q('auto-tog').className='tog'+(autoOn?' on':'');
+  if(autoOn)startPolling();
+}
+
+async function fetchNow(){
+  try{
+    await fetch('/api/fetch',{method:'POST'});
+    setTimeout(pollState,1000);
+  }catch(e){}
+}
+
+async function connectAngel(){
+  const ak=q('api-key').value.trim(),ci=q('client-id').value.trim(),
+        pin=q('angel-pin').value.trim(),ts=q('totp-secret').value.trim();
+  if(!ak||!ci||!pin||!ts){showMsg('All 4 fields required','red');return;}
+  const btn=q('connect-btn');btn.disabled=true;btn.textContent='CONNECTING...';
+  showMsg('Connecting to Angel One...','blu');
+  try{
+    const r=await fetch('/connect_angel',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:ak,client_id:ci,pin:pin,totp_secret:ts})});
+    const d=await r.json();
+    if(d.ok){
+      showMsg('✅ Login started — waiting for WebSocket...','grn');
+      localStorage.setItem('a_ak',ak);localStorage.setItem('a_ci',ci);
+      localStorage.setItem('a_pin',pin);localStorage.setItem('a_ts',ts);
+      setTimeout(pollState,3000);
+      setTimeout(pollState,8000);
+      setTimeout(pollState,15000);
+    }else{showMsg('❌ '+d.error,'red');}
+  }catch(e){showMsg('❌ Network error: '+e.message,'red');}
+  btn.disabled=false;btn.textContent='CONNECT ANGEL ONE';
+}
+
+function setIdx(i){
+  fetch('/api/set_index',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:i})}).then(()=>setTimeout(pollState,500));
+  ['NIFTY','SENSEX'].forEach(n=>q('ib-'+n).className='ib'+(n===i?' on':''));
+}
+
+async function saveTG(){
+  const tt=q('tg-token').value.trim(),tc=q('tg-chat').value.trim();
+  if(!tt||!tc){showMsg('Token & Chat ID required','red');return;}
+  const r=await fetch('/api/set_telegram',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({token:tt,chat_id:tc})});
+  const d=await r.json();
+  if(d.ok){t_('tg-st','✅ ON');showMsg('Telegram connected!','grn');}
+}
+
+async function saveCap(){
+  const cap=parseFloat(q('cap-inp').value||10000);
+  await fetch('/api/set_capital',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({capital:cap})});
+  showMsg('Capital saved ₹'+cap,'grn');
+}
+
+function saveKey(){const k=q('ki').value.trim();if(k){localStorage.setItem('mbk',k);t_('kst','✅ Saved');}}
+function loadSaved(){
+  const k=localStorage.getItem('mbk');if(k){q('ki').value=k;t_('kst','✅');}
+  const ak=localStorage.getItem('a_ak');if(ak)q('api-key').value=ak;
+  const ci=localStorage.getItem('a_ci');if(ci)q('client-id').value=ci;
+  const pin=localStorage.getItem('a_pin');if(pin)q('angel-pin').value=pin;
+  const ts=localStorage.getItem('a_ts');if(ts)q('totp-secret').value=ts;
 }
 
 function applyState(s){
   if(!s)return;SS=s;
   const mk=s.market||{};const sys=s.sys||{};
   const sp=mk.spot,atm=mk.atm,pcr=mk.pcr;
-  t_('nv',sp?sp.toFixed(0):'—');t_('n-spot',sp?sp.toFixed(0):'—');
-  t_('n-atm',atm?'ATM:'+atm:'ATM:—');t_('s-spot',sp?sp.toFixed(0):'—');
+  t_('nv',sp?sp.toFixed(0):'—');
+  t_('n-spot',sp?sp.toFixed(0):'—');t_('n-atm',atm?'ATM:'+atm:'ATM:—');
+  t_('s-spot',sp?sp.toFixed(0):'—');t_('s-atm',atm?'ATM:'+atm:'ATM:—');
   t_('vv',mk.vix?mk.vix.toFixed(1):'—');
   t_('callOI',fmtOI(mk.call_oi));t_('putOI',fmtOI(mk.put_oi));
   t_('sup',mk.support||'—');t_('res',mk.resistance||'—');
@@ -1040,26 +1136,35 @@ function applyState(s){
   t_('ceVal',ce?'₹'+ce.toFixed(0):'—');t_('peVal',pe?'₹'+pe.toFixed(0):'—');
   if(ce&&cep){const c=ce-cep;t_('ceChg',(c>=0?'+':'')+c.toFixed(1));q('ceChg').style.color=c>0?'var(--grn)':'var(--red)';}
   if(pe&&pep){const c=pe-pep;t_('peChg',(c>=0?'+':'')+c.toFixed(1));q('peChg').style.color=c>0?'var(--red)':'var(--grn)';}
-  t_('cyc',sys.count||0);t_('ft',mk.fetch_time||'—');
-  t_('sys-src',sys.source||'—');t_('sys-ft',mk.fetch_time||'—');
+  t_('cyc',sys.count||0);t_('stxt','Live — '+mk.fetch_time||'polling');
+  t_('stxt',sys.source==='ANGEL ONE'?'✅ Angel One Live':'⏳ Waiting for Angel One');
+  q('stxt').style.color=sys.source==='ANGEL ONE'?'var(--grn)':'var(--gold)';
   t_('src-cnt','Cycle #'+(sys.count||0));
-  updateSrc(sys.source||'NONE');
+  if(sys.source==='ANGEL ONE'){
+    q('src-row').className='src-row live';t_('src-lbl','✅ ANGEL ONE LIVE');
+    q('sdot').className='sdot ok';
+  }else{q('src-row').className='src-row none';t_('src-lbl','NOT CONNECTED');}
   const ags=s.agents||{};
   for(const [id,ag] of Object.entries(ags))updateAgent(id,ag);
   if(s.nambi)applyNambi(s.nambi);
   const l15=s.l15||{};const vc=l15.verdict;
   t_('l15v',vc||'—');
   q('l15v').style.color=vc==='TRUE_MOVE'?'var(--grn)':vc==='FAKE_MOVE'?'var(--red)':vc==='TRAP'?'var(--orn)':'var(--dim)';
-  t_('l15r',l15.reason||'—');t_('l15c',l15.confidence?l15.confidence+'%':'');
-  const l16=s.l16||{};const ts=l16.trap_status;
-  t_('l16v',ts||'—');
-  q('l16v').style.color=(ts==='CALL_TRAP'||ts==='PUT_TRAP')?'var(--red)':ts==='TRUE_MOVE'?'var(--grn)':'var(--dim)';
-  t_('l16a',l16.action||'—');t_('l16d',l16.reason||'—');t_('l16c',l16.confidence?l16.confidence+'%':'');
+  t_('l15r',l15.reason||'—');
+  const l16=s.l16||{};
+  t_('l16v',l16.trap_status||'—');
+  q('l16v').style.color=(l16.trap_status==='CALL_TRAP'||l16.trap_status==='PUT_TRAP')?'var(--red)':l16.trap_status==='TRUE_MOVE'?'var(--grn)':'var(--dim)';
+  t_('l16a',l16.action||'—');t_('l16d',l16.reason||'—');
   const l17=s.l17||{};
   t_('l17t',l17.total_trades||0);t_('l17w',l17.wins||0);t_('l17l',l17.losses||0);t_('l17r',(l17.win_rate||0)+'%');
   const ang=s.angel||{};
+  t_('sys-angel',ang.connected?'✅ '+ang.client_id:'❌ Not connected');
+  t_('sys-ws',ang.ws_running?'✅ Live':'❌ Stopped');
+  t_('sys-src',sys.source||'—');t_('sys-ft',mk.fetch_time||'—');
+  t_('sys-err',ang.error||'None');
   if(ang.connected)t_('angel-st','✅ '+ang.client_id);
   if(s.telegram&&s.telegram.enabled)t_('tg-st','✅ ON');
+  if(mk.call_oi){q('oi-badge').className='badge live';t_('oi-badge','LIVE');}
 }
 
 function updateAgent(id,ag){
@@ -1067,10 +1172,9 @@ function updateAgent(id,ag){
   const el=q('ag-'+id);
   if(el)el.className='agc '+(sig==='bull'?'bull':sig==='bear'?'bear':sig==='hold'?'hold':'');
   const sc=q('sig-'+id);
-  if(sc){sc.textContent=sig==='bull'?'BULL':sig==='bear'?'BEAR':sig==='hold'?'HOLD':'—';sc.className='ag-sig '+(sig||'none');}
+  if(sc){sc.textContent=sig==='bull'?'BULL':sig==='bear'?'BEAR':sig==='hold'?'HOLD':'—';sc.className='ag-sig '+sig;}
   t_('det-'+id,ag.detail||'—');
   t_('conf-'+id,ag.confidence?'Conf:'+ag.confidence+'%':'');
-  t_('w-'+id,ag.weight?'W:'+ag.weight.toFixed(1):'');
 }
 
 function applyNambi(n){
@@ -1078,10 +1182,9 @@ function applyNambi(n){
   const sig=n.signal||'WAIT';
   const box=q('nambi-box');
   box.className='nambi-box '+(sig==='BUY CE'?'buy-ce':sig==='BUY PE'?'buy-pe':sig==='WAIT'?'wait':'idle');
-  const sc=q('nambi-sig');
-  sc.textContent=sig;
+  const sc=q('nambi-sig');sc.textContent=sig;
   sc.style.color=sig==='BUY CE'?'var(--grn)':sig==='BUY PE'?'var(--red)':'var(--gold)';
-  t_('nambi-conf',n.confidence+' CONFIDENCE'+(n.trap_detected?' | ⚠️ TRAP':'')+(n.conflict?' | ⚡ CONFLICT':''));
+  t_('nambi-conf',n.confidence+' CONFIDENCE'+(n.trap_detected?' | ⚠️ TRAP':'')+(n.conflict?' | CONFLICT':''));
   q('conf-bull').style.width=(n.bull_pct||50)+'%';
   q('conf-bear').style.width=(n.bear_pct||50)+'%';
   t_('bull-pct','BULL '+(n.bull_pct||50)+'%');
@@ -1093,153 +1196,75 @@ function applyNambi(n){
   }else rl.style.display='none';
 }
 
-function updateSrc(src){
-  const row=q('src-row');
-  if(src==='ANGEL ONE'){
-    row.className='src-row live';t_('src-lbl','✅ ANGEL ONE LIVE');
-    q('sdot').className='sdot ok';q('stxt').textContent='Angel One live';q('stxt').style.color='var(--grn)';
-  }else{
-    row.className='src-row none';t_('src-lbl','NOT CONNECTED');
-    q('sdot').className='sdot wait';q('stxt').textContent='Waiting...';q('stxt').style.color='var(--gold)';
-  }
-}
-
-function appendCCS(ev){
-  const el=document.createElement('div');
-  const cls=ev.type||'';
-  el.className='ccs-item '+cls;
-  el.style.borderLeftColor=cls.includes('DECISION')?'var(--blu)':cls.includes('RESULT')?'var(--pur)':cls.includes('CONNECTED')||cls.includes('LOGIN')?'var(--grn)':'var(--gold)';
-  el.innerHTML='<span style="color:var(--dim);margin-right:6px">'+ev.ts+'</span><span style="color:var(--orn);margin-right:4px">'+ev.source+'→'+ev.target+'</span><span>'+ev.message+'</span>';
-  const log=q('ccs-log');log.prepend(el);
-  if(log.children.length>80)log.lastChild.remove();
-}
-function renderCCS(evs){q('ccs-log').innerHTML='';evs.slice().reverse().forEach(ev=>appendCCS(ev));}
-
-function connectAngel(){
-  const ak=q('api-key').value.trim(),ci=q('client-id').value.trim(),
-        pin=q('angel-pin').value.trim(),ts=q('totp-secret').value.trim();
-  if(!ak||!ci||!pin||!ts){showMsg('All 4 fields required','red');return;}
-  showMsg('Connecting...','blu');
-  wsSend({type:'connect_angel',api_key:ak,client_id:ci,pin:pin,totp_secret:ts});
-  localStorage.setItem('a_ak',ak);localStorage.setItem('a_ci',ci);
-  localStorage.setItem('a_pin',pin);localStorage.setItem('a_ts',ts);
-}
-function setIdx(i){
-  wsSend({type:'set_index',index:i});
-  ['NIFTY','SENSEX'].forEach(n=>q('ib-'+n).className='ib'+(n===i?' on':''));
-}
-function doFetch(){wsSend({type:'fetch'});}
-function toggleAuto(){autoOn=!autoOn;wsSend({type:'set_auto',on:autoOn});q('auto-tog').className='tog'+(autoOn?' on':'');}
-function saveTG(){
-  const tt=q('tg-token').value.trim(),tc=q('tg-chat').value.trim();
-  if(!tt||!tc){showMsg('Token & Chat ID required','red');return;}
-  wsSend({type:'set_telegram',token:tt,chat_id:tc});
-}
-function saveCap(){
-  const cap=parseFloat(q('cap-inp').value||10000);
-  wsSend({type:'set_capital',capital:cap});showMsg('Capital saved ₹'+cap,'grn');
-}
-function saveKey(){const k=q('ki').value.trim();if(k){localStorage.setItem('mbk',k);t_('kst','✅ Saved');}}
-function loadSaved(){
-  const k=localStorage.getItem('mbk');if(k){q('ki').value=k;t_('kst','✅ Loaded');}
-  const ak=localStorage.getItem('a_ak');if(ak)q('api-key').value=ak;
-  const ci=localStorage.getItem('a_ci');if(ci)q('client-id').value=ci;
-  const pin=localStorage.getItem('a_pin');if(pin)q('angel-pin').value=pin;
-  const ts=localStorage.getItem('a_ts');if(ts)q('totp-secret').value=ts;
-}
-
 async function runClaude(){
   const key=localStorage.getItem('mbk');
-  if(!key){alert('Setup tab-ல் Claude API Key enter பண்ணுங்க');return;}
+  if(!key){alert('Setup tab → Claude API Key enter பண்ணுங்க');return;}
   const btn=q('go-btn');btn.disabled=true;btn.textContent='Analysing...';
   q('claude-box').style.display='block';
-  const ct=q('claude-text');ct.textContent='HEMAN analysing...';
+  const ct=q('claude-text');ct.textContent='HEMAN analysing market...';
   const s=SS;const mk=s.market||{};const nb=s.nambi||{};const l16=s.l16||{};const l15=s.l15||{};
   const prompt=`You are Nambi from Mathan AI HEMAN — Behaviour Intelligence Trading Engine.
-
-LIVE DATA:
-Index:${s.sys?.index||'NIFTY'} Spot:${mk.spot?.toFixed(0)||'—'} ATM:${mk.atm||'—'}
-VIX:${mk.vix?.toFixed(1)||'—'} PCR:${mk.pcr?.toFixed(2)||'—'}
-Call OI:${mk.call_oi||'—'} Put OI:${mk.put_oi||'—'}
-CE:₹${mk.ce_prem?.toFixed(0)||'—'} PE:₹${mk.pe_prem?.toFixed(0)||'—'}
+LIVE DATA: Index:${s.sys?.index||'NIFTY'} Spot:${mk.spot?.toFixed(0)||'—'} ATM:${mk.atm||'—'} VIX:${mk.vix?.toFixed(1)||'—'} PCR:${mk.pcr?.toFixed(2)||'—'}
+Call OI:${mk.call_oi||'—'} Put OI:${mk.put_oi||'—'} CE:₹${mk.ce_prem?.toFixed(0)||'—'} PE:₹${mk.pe_prem?.toFixed(0)||'—'}
 Support:${mk.support||'—'} Resistance:${mk.resistance||'—'}
-
 NAMBI: ${nb.signal||'WAIT'} | ${nb.confidence||'—'} | Bull:${nb.bull_pct||50}% Bear:${nb.bear_pct||50}%
-L15 Truth: ${l15.verdict||'—'} — ${l15.reason||'—'}
-L16 Contradiction: ${l16.trap_status||'—'} → ${l16.action||'—'}
-
+L15:${l15.verdict||'—'} L16:${l16.trap_status||'—'}→${l16.action||'—'}
 Capital:₹${q('cap').value||10000}
-
-Give precise strategy: Entry strike, Premium, SL, Target, Lots. Max 150 words. Direct.`;
+Give: Entry strike, Premium, SL, Target, Lots. Max 150 words.`;
   try{
     const resp=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,messages:[{role:'user',content:prompt}]})
     });
     const data=await resp.json();
-    const txt=data.content?.map(i=>i.text||'').join('')||'No response';
-    ct.innerHTML=txt.replace(/\n/g,'<br>');
+    ct.innerHTML=(data.content?.map(i=>i.text||'').join('')||'No response').replace(/\n/g,'<br>');
   }catch(e){ct.textContent='Error:'+e.message;}
   btn.disabled=false;btn.textContent='⚡ NAMBI + CLAUDE — FULL STRATEGY';
 }
 
 function runTrade(){
   const s=SS;const mk=s.market||{};const nb=s.nambi||{};
-  const cap=parseFloat(q('cap').value||10000);
-  const sig=nb.signal||'WAIT';
-  q('claude-box').style.display='block';
-  const ct=q('claude-text');
+  const cap=parseFloat(q('cap').value||10000);const sig=nb.signal||'WAIT';
+  q('claude-box').style.display='block';const ct=q('claude-text');
   if(sig==='WAIT'){ct.textContent='NAMBI says WAIT — No trade now.';return;}
   const lot=s.sys?.index==='NIFTY'?75:20;
   const price=sig==='BUY CE'?mk.ce_prem:mk.pe_prem;
   if(!price){ct.textContent='Premium not available.';return;}
   const lots=Math.max(1,Math.floor(cap/(price*lot)));
   const sl=(price*0.35).toFixed(0);const tgt=(price*1.6).toFixed(0);
-  ct.innerHTML=`<b>${sig}</b> — ATM ${mk.atm}<br>Premium:₹${price.toFixed(0)}<br>Lots:${lots} (₹${(lots*lot*price).toFixed(0)} margin)<br>SL:₹${sl} | Target:₹${tgt}<br>Risk:₹${(lots*lot*(price-sl)).toFixed(0)} | Reward:₹${(lots*lot*(tgt-price)).toFixed(0)}`;
+  ct.innerHTML=`<b>${sig}</b> ATM ${mk.atm}<br>Premium:₹${price.toFixed(0)}<br>Lots:${lots}<br>SL:₹${sl} | Target:₹${tgt}<br>Risk:₹${(lots*lot*(price-sl)).toFixed(0)} | Reward:₹${(lots*lot*(tgt-price)).toFixed(0)}`;
 }
 
 function q(i){return document.getElementById(i);}
 function t_(i,v){const e=q(i);if(e)e.textContent=v;}
 function fmtOI(n){if(!n)return'—';if(n>10000000)return(n/10000000).toFixed(1)+'Cr';if(n>100000)return(n/100000).toFixed(1)+'L';if(n>1000)return(n/1000).toFixed(1)+'K';return''+n;}
-function wst(t){q('ws-txt').textContent=t;}
 function showMsg(msg,col){
   const d=q('status-msg');d.style.display='block';d.textContent=msg;
-  const cols={grn:'var(--grn)',red:'var(--red)',blu:'var(--blu)',orn:'var(--orn)'};
-  d.style.color=cols[col]||'var(--blu)';
-  setTimeout(()=>{d.style.display='none';},5000);
+  const cols={grn:'rgba(0,230,118,.15)',red:'rgba(255,23,68,.15)',blu:'rgba(41,182,246,.15)',orn:'rgba(255,152,0,.15)'};
+  const tc={grn:'var(--grn)',red:'var(--red)',blu:'var(--blu)',orn:'var(--orn)'};
+  d.style.background=cols[col]||cols.blu;d.style.color=tc[col]||tc.blu;
+  setTimeout(()=>{d.style.display='none';},6000);
 }
 setInterval(()=>{
   const n=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
   const p=v=>String(v).padStart(2,'0');
-  const ts=p(n.getHours())+':'+p(n.getMinutes())+':'+p(n.getSeconds());
-  t_('clock',ts);t_('rtxt','IST '+ts);
+  t_('clock',p(n.getHours())+':'+p(n.getMinutes())+':'+p(n.getSeconds()));
 },1000);
-window.onload=()=>{loadSaved();connect();};
+window.onload=()=>{loadSaved();startPolling();};
 </script>
 </body>
 </html>"""
 
 # ── STARTUP ──────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("╔══════════════════════════════════════╗")
-    log.info("║   MATHAN AI HEMAN — STARTING        ║")
-    log.info("║   High Efficiency Market Adaptive   ║")
-    log.info("╚══════════════════════════════════════╝")
-    db_init()
-    db_load()
-    l17_load()
+    log.info("MATHAN AI HEMAN — Starting...")
+    db_init();db_load();l17_load()
     if all([ANGEL["api_key"],ANGEL["client_id"],ANGEL["pin"],ANGEL["totp_secret"]]):
-        log.info("[STARTUP] Credentials found — auto-connecting Angel One...")
-        threading.Thread(
-            target=do_angel_connect,
+        log.info("[STARTUP] Auto-connecting Angel One...")
+        threading.Thread(target=do_angel_connect,
             args=(ANGEL["api_key"],ANGEL["client_id"],ANGEL["pin"],ANGEL["totp_secret"]),
-            daemon=True
-        ).start()
-    else:
-        log.info("[STARTUP] No credentials — waiting for user login via dashboard")
+            daemon=True).start()
     threading.Thread(target=push_loop,daemon=True).start()
     threading.Thread(target=poll_loop,daemon=True).start()
-    ip=local_ip()
-    log.info(f"OPEN: http://{ip}:{PORT}")
-    log.info(f"PING: http://{ip}:{PORT}/ping")
+    log.info(f"http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0",port=PORT,use_reloader=False,threaded=True)
